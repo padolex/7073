@@ -1,0 +1,9 @@
+
+filesystem
+public_keys
+fileserver
+*_keyfile
+*.o
+fileserver-asan
+build-asan/
+san-logs/
