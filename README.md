@@ -22,7 +22,7 @@ Details:
 | Language | C++17, STL (incl. `std::filesystem`) |
 | Libraries | OpenSSL 3 `libcrypto`; nlohmann/json 3.11.3, header-only, vendored in `third_party/` (MIT) |
 | Binary | **static-PIE** ELF, full RELRO, stack protector, `_FORTIFY_SOURCE=2`, zero compiler warnings |
-| Tests | `tests/run_tests.sh`: 78 end-to-end checks; also clean under ASan + UBSan (`make test-asan`) |
+| Tests | `tests/run_tests.sh`: 80 end-to-end checks; also clean under ASan + UBSan (`make test-asan`) |
 
 ---
 
@@ -93,7 +93,7 @@ associated data = "bibifi-new/v1|" + label
 | `registry` | `{"users":[{"name","uid","role","fpr"}, …]}` (exactly one `admin`) | `init`, `adduser` |
 | `tree\|<uid>` | the user's `/personal` tree as nested JSON (below) | `mkdir`, `mkfile` |
 | `blob\|<uid>\|<blob>` | `{"content": "<file contents>"}` | `mkfile` |
-| `share\|<uid>` | every file shared **with** that user: `{"shares":[{"owner","blob","path"}, …]}` | `share` (under a lock) |
+| `share\|<uid>` | every file shared **with** that user: `{"shares":[{"owner","blob","path"}, …]}` | `share` |
 
 The nested tree after decryption:
 
@@ -108,9 +108,8 @@ re-encrypts the same blob with a fresh nonce), recipients see the new contents a
 entry's `path` is the file's location in the owner's `/personal`, so Bob sharing `a/file` with
 Alice appears to her as `/shared/bob/a/file`. Same-name files from different folders don't clash.
 
-Several users may share with the same person at once. The update of that person's share list
-runs under an exclusive `flock` on `filesystem/`, so no share is lost (tested with 8 concurrent
-sharers).
+There is no lock: if two users share with the same person at the very same instant, one of the
+two shares can be lost (see `ARCH.md` §7). Shares made one after another are always kept.
 
 ### What a host observer sees
 
@@ -183,6 +182,13 @@ The same as `../cc` (see `../cc/REPORT.md` §7 for every message):
   is `Forbidden`. Users can share with the admin.
 * Directory depth is capped at 64 levels below `/personal` (`Invalid Command` beyond), which
   bounds JSON nesting.
+* **Prompt.** Before every command the shell prints `<user>:/<cwd>> `, for example
+  `alice:/personal/docs> `, using `std::cout` only. Standard C++ can't tell a terminal from a pipe,
+  so the prompt is printed in both cases: piped output contains the prompts too (the test suite
+  strips them).
+* **Standard C++ only.** Apart from OpenSSL and nlohmann/json, the code uses only the C++17
+  standard library. It makes no POSIX calls (`umask`, `isatty`, `flock`); see "Secure-coding
+  choices" for how keyfiles stay private without `umask`.
 
 ---
 
@@ -202,7 +208,9 @@ The same as `../cc` (see `../cc/REPORT.md` §7 for every message):
 * **Size hiding:** plaintexts are length-prefixed and padded to 256-byte buckets.
 * **Safe files:**
   - atomic writes (temporary file, then `rename`);
-  - keyfiles created under `umask(077)` and forced to 0600;
+  - keyfiles are written inside a fresh directory that is made owner-only before anything is
+    created in it, set to 0600, and then renamed into place, so no other account can open them
+    at any point. This uses only `std::filesystem`, with no `umask`;
   - symlinked or non-regular objects refused;
   - size caps (64 MiB objects, 64 KiB keyfiles, 1 MiB input lines);
   - ids validated as fixed-length hex before use in any path, so there is no path traversal.
@@ -277,7 +285,7 @@ This format is **not compatible** with `../cc`. Run each binary in its own direc
 ## 7. Test
 
 ```bash
-make test             # 78 checks in a throwaway sandbox (mktemp -d)
+make test             # 80 checks in a throwaway sandbox (mktemp -d)
 ```
 
 The suite covers:
@@ -296,7 +304,7 @@ The suite covers:
   list is never overwritten by a new share).
 - **Sharing with paths:** the owner's folders appear under `/shared/<owner>/`, same-name files in
   different folders are both visible, nested shared folders are read-only, unshared siblings stay
-  hidden, and 8 concurrent sharers to one user lose nothing.
+  hidden, and shares from several owners to one user are all kept.
 - **Keyfile attacks:**
   - edited name or uid, a path-traversal uid;
   - JSON nesting bomb, extra field, wrong type, trailing data;
@@ -315,7 +323,7 @@ make test-asan        # whole suite against it; any sanitizer report fails the t
 
 `test-asan` builds with `-fsanitize=address,undefined -fno-sanitize-recover=all
 -fno-omit-frame-pointer -g -O1` and writes reports to `san-logs/`. Expected output ends with
-`passed: 78  failed: 0` and `sanitizers: no reports`. The sanitizer runtimes can't be linked
+`passed: 80  failed: 0` and `sanitizers: no reports`. The sanitizer runtimes can't be linked
 statically, so this binary is for development only. **Submit `./fileserver`.**
 
 | Target | Result |

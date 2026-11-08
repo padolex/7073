@@ -83,8 +83,6 @@ void Shell::printHelp() {
     out_ << "  exit\n";
 }
 
-std::string Shell::prompt() { return id_.name + ":/" + joinPath(cwd_) + "> "; }
-
 void Shell::refresh() {
     cache_.clear();
     auto reg = store_.loadRegistry();
@@ -206,6 +204,8 @@ std::optional<Shell::Walk> Shell::walk(const std::string& path) {
     }
     return w;
 }
+
+std::string Shell::prompt() const { return id_.name + ":/" + joinPath(cwd_) + "> "; }
 
 bool Shell::execute(const std::string& rawLine) {
     std::string line = rawLine;

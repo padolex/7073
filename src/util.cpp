@@ -2,7 +2,6 @@
 
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
-#include <sys/stat.h>  // umask (POSIX); see REPORT.md, "Secure coding choices"
 
 #include <fstream>
 #include <stdexcept>
@@ -72,35 +71,70 @@ std::optional<Bytes> readFile(const fs::path& p, bool followSymlinks, std::uintm
     return buf;
 }
 
-void writeFileAtomic(const fs::path& p, const Bytes& data, bool secret) {
-    fs::path tmp = p;
-    tmp += ".tmp-" + randomHex(8);
-    std::ofstream out;
-    if (secret) {
-        mode_t old = ::umask(077);
-        out.open(tmp, std::ios::binary | std::ios::trunc);
-        ::umask(old);
-    } else {
-        out.open(tmp, std::ios::binary | std::ios::trunc);
-    }
-    std::error_code ec;
+namespace {
+
+// Writes `data` to `tmp` and closes it; throws on any failure.
+void writeAll(const fs::path& tmp, const Bytes& data) {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("cannot create file");
     out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
     out.flush();
-    bool ok = static_cast<bool>(out);
+    const bool ok = static_cast<bool>(out);
     out.close();
-    if (!ok) {
-        fs::remove(tmp, ec);
-        throw std::runtime_error("cannot write file");
+    if (!ok) throw std::runtime_error("cannot write file");
+}
+
+constexpr fs::perms kOwnerOnlyDir = fs::perms::owner_all;
+constexpr fs::perms kOwnerOnlyFile = fs::perms::owner_read | fs::perms::owner_write;
+
+}  // namespace
+
+void writeFileAtomic(const fs::path& p, const Bytes& data, bool secret) {
+    std::error_code ec;
+    if (!secret) {
+        fs::path tmp = p;
+        tmp += ".tmp-" + randomHex(8);
+        try {
+            writeAll(tmp, data);
+        } catch (...) {
+            fs::remove(tmp, ec);
+            throw;
+        }
+        fs::rename(tmp, p, ec);  // atomic replace; replaces a symlink, never follows it
+        if (ec) {
+            fs::remove(tmp, ec);
+            throw std::runtime_error("cannot commit file");
+        }
+        return;
     }
-    if (secret) {
-        fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+
+    // Secret files (keyfiles) must never be readable by anyone else, not even
+    // for an instant. Standard C++ cannot create a file with restricted
+    // permissions (there is no umask), so the file is staged inside a fresh
+    // directory that is made owner-only BEFORE anything is created in it.
+    // Directory permissions are checked on every path lookup, so nobody else
+    // can open the staged file, even with a handle to the directory taken
+    // earlier. The finished file is made 0600 and then renamed into place.
+    const fs::path stage = p.parent_path() / (".stage-" + randomHex(16));
+    if (!fs::create_directory(stage, ec) || ec) throw std::runtime_error("cannot create staging directory");
+    try {
+        fs::permissions(stage, kOwnerOnlyDir, fs::perm_options::replace, ec);
+        // Until the line above ran, the directory had default permissions.
+        // Refuse to continue if anything appeared in it meanwhile.
+        if (ec || fs::status(stage).permissions() != kOwnerOnlyDir || !fs::is_empty(stage)) {
+            throw std::runtime_error("staging directory is not private");
+        }
+        const fs::path tmp = stage / randomHex(16);
+        writeAll(tmp, data);
+        fs::permissions(tmp, kOwnerOnlyFile, fs::perm_options::replace, ec);
+        if (ec || fs::status(tmp).permissions() != kOwnerOnlyFile) throw std::runtime_error("cannot restrict file");
+        fs::rename(tmp, p, ec);  // same directory tree, so rename is atomic
+        if (ec) throw std::runtime_error("cannot commit file");
+    } catch (...) {
+        fs::remove_all(stage, ec);
+        throw;
     }
-    fs::rename(tmp, p, ec);  // atomic replace; replaces a symlink, never follows it
-    if (ec) {
-        fs::remove(tmp, ec);
-        throw std::runtime_error("cannot commit file");
-    }
+    fs::remove(stage, ec);
 }
 
 Bytes toBytes(const std::string& s) { return Bytes(s.begin(), s.end()); }

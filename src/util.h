@@ -33,8 +33,9 @@ std::string randomHex(std::size_t nBytes);
 std::optional<Bytes> readFile(const fs::path& p, bool followSymlinks = false,
                               std::uintmax_t maxSize = kMaxObjectSize);
 // Writes via temp-file + rename so readers never observe a partial object.
-// When `secret` is set the file is created with umask 077 (mode 0600) so there
-// is no window in which another local account can open it.
+// When `secret` is set the file is staged in a fresh owner-only directory and
+// made 0600 before it is moved into place, so no other account can open it at
+// any point (standard C++ only: no umask).
 void writeFileAtomic(const fs::path& p, const Bytes& data, bool secret = false);
 
 Bytes toBytes(const std::string& s);

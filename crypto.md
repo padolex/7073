@@ -250,8 +250,10 @@ filesystem to a state newer than the user's last session, which needs a trusted 
 
 ### 7.4 Keyfiles are bearer credentials
 The private key is stored unencrypted, as the spec requires (no passphrase prompt). Whoever copies
-a keyfile *is* that user. The program writes keyfiles with mode 0600 (created under `umask(077)`,
-then renamed into place) and never prints them.
+a keyfile *is* that user. The program writes keyfiles with mode 0600 and never prints them. Each
+keyfile is first written inside a fresh directory that is made owner-only before anything is
+created in it, then set to 0600 and renamed into place, so no other account can open it at any
+point. This uses only `std::filesystem` (`writeFileAtomic` in `src/util.cpp`).
 
 ### 7.5 Metadata
 Visible to anyone:
@@ -289,7 +291,7 @@ revocation or rotation command.
 | Subkey derivation | `src/storage.cpp`: `Store::Store` (HKDF `info` strings) |
 | AES-GCM and padding | `src/crypto.cpp`: `aeadEncrypt`, `aeadDecrypt`, `pad`, `unpad` |
 | Object encryption and naming | `src/storage.cpp`: `putObject`, `getObject`, `objectPath` |
-| Share lists and the lock | `src/storage.cpp`: `saveShare`, `loadShares`, `DirLock` |
+| Share lists | `src/storage.cpp`: `saveShare`, `loadShares` |
 | Ed25519 keys and signatures | `src/crypto.cpp`: `generateUserKey`, `sign`, `verify`, `fingerprint` |
 | Login | `src/shell.cpp`: `login`; `src/storage.cpp`: `proveKeyPossession`, `loadPinnedPublicKey` |
 | Randomness, wiping, atomic writes | `src/util.cpp`: `randomBytes`, `wipe`, `writeFileAtomic` |

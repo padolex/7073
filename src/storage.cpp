@@ -1,9 +1,5 @@
 #include "storage.h"
 
-#include <fcntl.h>     // open: a descriptor on ./filesystem to lock
-#include <sys/file.h>  // flock: serialises share-list updates between sessions
-#include <unistd.h>    // close
-
 
 #include "internal_secret.h"
 
@@ -20,23 +16,6 @@ std::string treeLabel(const std::string& uid) { return "tree|" + uid; }
 std::string blobLabel(const std::string& owner, const std::string& blob) { return "blob|" + owner + "|" + blob; }
 std::string shareLabel(const std::string& recipient) { return "share|" + recipient; }
 
-// Exclusive advisory lock on the ./filesystem directory itself, so no extra
-// (unencrypted) lock file is needed. Released when destroyed.
-class DirLock {
-public:
-    explicit DirLock(const fs::path& dir) : fd_(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)) {
-        if (fd_ < 0 || ::flock(fd_, LOCK_EX) != 0) {
-            if (fd_ >= 0) ::close(fd_);
-            throw std::runtime_error("cannot lock filesystem");
-        }
-    }
-    ~DirLock() { ::close(fd_); }  // closing the descriptor releases the lock
-    DirLock(const DirLock&) = delete;
-    DirLock& operator=(const DirLock&) = delete;
-
-private:
-    int fd_;
-};
 
 // --- tree validation -------------------------------------------------------------
 
@@ -368,7 +347,8 @@ bool Store::saveShare(const std::string& recipientUid, const ShareRec& rec) cons
         !isLowerHex(rec.blob, kBlobHexLen) || !isValidSharePath(rec.path)) {
         throw std::runtime_error("invalid share");
     }
-    DirLock lock(fsDir_);  // read-modify-write of a list other sessions also update
+    // Read-modify-write without a lock: two users sharing with the same
+    // recipient at the same instant can lose one entry (last writer wins).
     auto shares = loadShares(recipientUid);
     if (!shares) return false;
     // One entry per (owner, file): sharing the same file again is a no-op

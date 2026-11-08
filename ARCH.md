@@ -49,7 +49,6 @@ Ids from that run, used throughout:
 │ storage.cpp  ENCRYPTED JSON OBJECT STORE                             │
 │   putObject / getObject: JSON ⇄ AES-GCM ciphertext under K_enc       │
 │   registry · trees · blobs · share lists · keyfiles · public keys    │
-│   DirLock: flock on filesystem/ around share-list updates            │
 ├────────────────────────┬──────────────────────┬──────────────────────┤
 │ jsonio.cpp             │ crypto.cpp           │ util.cpp             │
 │ strict nlohmann/json   │ OpenSSL EVP wrappers │ safe file I/O, hex,  │
@@ -249,10 +248,9 @@ One object per recipient lists every file shared **with** that user. Bob's:
 * **Fails closed.** If the list fails authentication, the recipient gets
   `Error: filesystem integrity check failed`. A later `share` refuses to overwrite it, so entries
   are never silently replaced.
-* **Concurrency.** Several users can share with the same recipient at the same time. `saveShare`
-  does its read-modify-write under an exclusive `flock` on the `filesystem/` directory, so no
-  entry is lost (tested with 8 simultaneous sharers). The lock is on the directory itself, so no
-  extra file is needed.
+* **No lock.** `saveShare` reads the list, adds the entry and writes the list back. If two users
+  share with the same recipient at the very same instant, both may read the old list, and the
+  second write then replaces the first: one share is lost (see §7, Concurrency).
 * Maximum JSON depth: 3.
 
 ### 5.5 Keyfile: `./<user>_keyfile` (outside `filesystem/`, not encrypted)
@@ -332,7 +330,7 @@ Trees and share lists are loaded on demand, at most once per command.
 | `mkdir` | registry, own tree | own tree |
 | `mkfile` (new file) | registry, own tree | **blob first**, then own tree |
 | `mkfile` (existing file) | registry, own tree | that blob only (same name, fresh nonce) |
-| `share` | registry, own tree; the recipient's share list (under the lock) | the recipient's share list (created if missing) |
+| `share` | registry, own tree; the recipient's share list | the recipient's share list (created if missing) |
 | `adduser` | registry | public key → new user's empty tree → keyfile → **registry last** |
 
 ### Commit points and crash safety
@@ -343,7 +341,7 @@ Trees and share lists are loaded on demand, at most once per command.
   unreferenced blob (harmless), never a tree pointing at nothing.
 * **New user:** the registry is the commit point. A crash before it leaves an unused public key,
   tree and keyfile, but the user doesn't exist and the keyfile is rejected.
-* **Share:** the whole list is rewritten atomically under the lock. A crash leaves either the old
+* **Share:** the whole list is rewritten atomically. A crash leaves either the old
   list or the new one.
 * **First run:** staging plus rename means `filesystem/` is either complete or absent.
   Initialisation runs only when `filesystem/` is missing or empty, so deleting objects can never
@@ -353,12 +351,16 @@ Trees and share lists are loaded on demand, at most once per command.
 
 * Every command reloads from disk, so a share made by another session shows up at once (tested
   with two live sessions).
-* Each user writes only their own tree and blobs. The only object several users write is a
-  recipient's share list, and that read-modify-write runs under the `flock` lock (§5.4). The
-  registry is written only by the admin.
-* Two sessions **of the same user** running `mkdir`/`mkfile` at the same instant could race on that
-  user's tree: last writer wins. Only share lists are locked, because only they are written by
-  several users; locking everything isn't needed for the spec's workload.
+* Each user writes only their own tree and blobs, and the registry is written only by the admin.
+* **There is no locking** (standard C++ has no file locks). Objects are replaced atomically, so a
+  reader never sees a half-written one, but two read-modify-writes of the same object at the same
+  instant can lose one update (last writer wins). Two cases can do that:
+  - **Share lists:** the only object several users write. Two users sharing with the same
+    recipient at the same moment can lose one share, silently. Without a lock, removing this
+    requires a separate list per (recipient, owner), so that each list has a single writer.
+  - **Trees:** only if one user runs two sessions that `mkdir`/`mkfile` at the same moment.
+* For interactive use, where commands from different users are seconds apart, neither happens;
+  the test suite checks that shares from several owners, one after another, are all kept.
 
 ---
 

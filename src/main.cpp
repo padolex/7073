@@ -1,8 +1,6 @@
 // fileserver - encrypted secure file system middleware (CMPT 785 BIBIFI).
 //
 // Usage: ./fileserver <keyfile>
-#include <unistd.h>  // isatty: only decides whether to print an interactive prompt
-
 #include <iostream>
 #include <string>
 
@@ -52,11 +50,9 @@ int main(int argc, char** argv) {
 
     Shell shell(store, std::move(*id), std::cout);
     shell.printHelp();
-    const bool interactive = ::isatty(STDIN_FILENO) != 0;
-
     std::string line;
     while (true) {
-        if (interactive) std::cout << shell.prompt() << std::flush;
+        std::cout << shell.prompt() << std::flush;
         if (!readLine(std::cin, line)) break;
         if (!shell.execute(line)) break;
         std::cout.flush();

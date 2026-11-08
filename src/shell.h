@@ -31,7 +31,8 @@ class Shell {
 public:
     Shell(const Store& store, Identity id, std::ostream& out);
     void printHelp();
-    std::string prompt();
+    // "<user>:/<cwd>> ", printed before every command.
+    std::string prompt() const;
     // Executes one input line. Returns false when the session should end.
     bool execute(const std::string& line);
 

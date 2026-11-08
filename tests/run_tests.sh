@@ -26,9 +26,13 @@ created_by() { comm -13 <(printf '%s\n' "$1") <(snap); }
 # modified_since <before-snapshot> <marker> -> pre-existing names rewritten after marker
 modified_since() { comm -12 <(printf '%s\n' "$1") <(find filesystem -mindepth 1 -maxdepth 1 -newer "$2" -printf '%f\n' | LC_ALL=C sort); }
 
-# run <keyfile> <stdin>  -> prints session output with the login banner/help removed
+# strip_prompts: remove the "<user>:/<cwd>> " prompts the shell prints before
+# every command (paths never contain spaces, so a prompt ends at the first "> ").
+strip_prompts() { sed -E -e 's/^([A-Za-z0-9_-]+:\/[^ ]*> )+//' -e '/^$/d'; }
+
+# run <keyfile> <stdin>  -> prints session output with the login banner/help and prompts removed
 run() {
-    printf '%s' "$2" | ./fileserver "$1" | sed -e '/^Available commands:$/d' -e '/^  /d' -e '/^Logged in as /d'
+    printf '%s' "$2" | ./fileserver "$1" | sed -e '/^Available commands:$/d' -e '/^  /d' -e '/^Logged in as /d' | strip_prompts
 }
 
 check() {  # check <name> <expected> <actual>
@@ -76,6 +80,7 @@ Forbidden
 File x doesn't exist
 Invalid Command" "$out"
 check "alice keyfile created 0600" "600" "$(stat -c %a alice_keyfile)"
+check "keyfile staging leaves nothing behind" "0" "$(find . -maxdepth 1 -name '.stage-*' | wc -l)"
 check "no traversal keyfile" "no" "$([ -e ../evil_keyfile ] || [ -e evil_keyfile ] && echo yes || echo no)"
 
 out=$(run admin_keyfile $'ls\n')
@@ -159,6 +164,8 @@ check "name length / control chars" "Invalid Command
 Invalid Command
 Invalid Command" "$out"
 
+check "prompt shows user and current directory" "alice:/> alice:/personal> /personal" \
+    "$(printf 'cd personal\npwd\n' | ./fileserver alice_keyfile | grep -F '/personal> /personal')"
 check "blank lines and EOF without exit" "" "$(run alice_keyfile $'\n\n   \n')"
 
 deep=$(printf 'cd personal\n'; for i in $(seq 1 64); do printf 'mkdir d\ncd d\n'; done; printf 'mkdir d\npwd\n')
@@ -215,7 +222,7 @@ echo 'cat live.txt' >&3
 echo 'exit' >&3
 exec 3>&-
 wait "$BOB_PID"
-out=$(tail -1 bob_out)
+out=$(strip_prompts < bob_out | tail -1)
 check "live session sees new share" "fresh" "$out"
 
 # ---------------------------------------------------------------- admin read-all
@@ -439,11 +446,16 @@ check "symlinked share list is refused" "Error: filesystem integrity check faile
 rm -f "filesystem/$CAROL_SH"; cp carol_sh.bak "filesystem/$CAROL_SH"
 check "restored list works again" "$CAROL_VIEW" "$(run carol_keyfile $'cd shared/alice\nls\n')"
 
-# Concurrent sharers update the same list under a lock: nothing is lost.
-run alice_keyfile "$(printf 'mkfile personal/c%d x\n' $(seq 1 8))" > /dev/null
-for i in $(seq 1 8); do run alice_keyfile "share personal/c$i carol"$'\n' > /dev/null & done
-wait
-check "8 concurrent shares to one user all kept" "8" "$(run carol_keyfile $'cd /shared/alice\nls\n' | grep -c '^f -> c[0-9]$')"
+# Several owners share with the same recipient, one after another: the list
+# keeps every entry. (There is no lock: shares at the very same instant may
+# race, see ARCH.md §7.)
+run bobby_keyfile $'mkfile personal/fromb x\nshare personal/fromb carol\n' > /dev/null
+run admin_keyfile $'mkfile personal/froma y\nshare personal/froma carol\n' > /dev/null
+check "shares from several owners all kept" "d -> .
+d -> ..
+d -> admin
+d -> alice
+d -> bobby" "$(run carol_keyfile $'cd /shared\nls\n')"
 
 # ---------------------------------------------------------------- fresh dir & existing empty fs dir
 mkdir fresh && cd fresh && cp ../fileserver . && mkdir filesystem

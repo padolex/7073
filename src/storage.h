@@ -127,10 +127,10 @@ public:
     void saveBlob(const std::string& ownerUid, const std::string& blob, const std::string& content) const;
 
     // --- sharing: one object per recipient, label "share|<uid>" ---
-    // Adds (or refreshes) one entry in the recipient's share list. The
-    // read-modify-write runs under an exclusive lock, so concurrent sharers
-    // never lose each other's entries. Returns false, writing nothing, if the
-    // existing list fails authentication (it is never silently replaced).
+    // Adds (or refreshes) one entry in the recipient's share list. Returns
+    // false, writing nothing, if the existing list fails authentication (it is
+    // never silently replaced). There is no lock: two shares to the same
+    // recipient at the same instant can lose one entry (see ARCH.md §7).
     bool saveShare(const std::string& recipientUid, const ShareRec& rec) const;
     // The recipient's share list: empty if nothing was ever shared with them,
     // nullopt if the object exists but is tampered or malformed.
