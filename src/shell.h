@@ -51,10 +51,7 @@ private:
         std::string ownerUid;
         json tree;
     };
-    struct UserData {
-        json tree;                                  // nested /personal tree (see storage.h)
-        std::map<std::string, SharedFrom> shares;   // owner name -> files shared by them
-    };
+    using SharedView = std::map<std::string, SharedFrom>;  // owner name -> files shared by them
     struct Walk {
         std::vector<std::string> comps;
         NType type;
@@ -70,13 +67,20 @@ private:
     std::ostream& out_;
     std::vector<std::string> cwd_;
 
-    // Reloaded for every command so concurrent sessions (e.g. a new share or
-    // a new user) are always observed.
+    // Reloaded for every command, so changes made by other sessions are seen.
+    Root root_;
+    std::uint64_t sessionEpoch_ = 0;  // newest root epoch seen in this session (memory only)
     Registry reg_;
-    std::map<std::string, UserData> cache_;
+    std::map<std::string, json> trees_;        // uid -> verified /personal tree
+    std::map<std::string, SharedView> shared_; // uid -> files shared with that user
 
     void refresh();
-    UserData& data(const std::string& uid);
+    const json& treeOf(const std::string& uid);
+    const SharedView& sharedWith(const std::string& uid);
+    std::vector<ShareRec> shareListOf(const std::string& uid);
+    // Commits a change: writes `next` (epoch root_.epoch + 1) as the new root
+    // and deletes the replaced versions.
+    void commit(const Root& next, const std::vector<std::string>& replaced);
     Loc locate(const std::vector<std::string>& comps);
     std::optional<Walk> walk(const std::string& path);
     std::optional<CreateTarget> resolveCreateTarget(const std::string& arg);

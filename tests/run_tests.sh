@@ -23,6 +23,10 @@ kf() { sed -n "s/^  \"$1\": \"\([^\"]*\)\",\{0,1\}\$/\1/p" "$2"; }
 snap() { find filesystem -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort; }
 # created_by <before-snapshot>  -> names that did not exist before
 created_by() { comm -13 <(printf '%s\n' "$1") <(snap); }
+# removed_since <before-snapshot>  -> names that no longer exist
+removed_since() { comm -23 <(printf '%s\n' "$1") <(snap); }
+# count <lines>  -> number of non-empty lines
+count() { printf '%s\n' "$1" | grep -c .; }
 # modified_since <before-snapshot> <marker> -> pre-existing names rewritten after marker
 modified_since() { comm -12 <(printf '%s\n' "$1") <(find filesystem -mindepth 1 -maxdepth 1 -newer "$2" -printf '%f\n' | LC_ALL=C sort); }
 
@@ -302,11 +306,19 @@ for u in "$ALICE_UID" "$BOB_UID" "$CAROL_UID"; do
 done
 check "no user id appears in any name or content (no ownership grouping)" "0" "$uidleak"
 
-before=$(snap); run alice_keyfile $'cd personal\nmkfile s1 a\n' > /dev/null; S1=$(created_by "$before")
+# A new file creates two objects (the file, the owner's new tree version),
+# removes one (the replaced tree version) and rewrites the root.
+before=$(snap); run alice_keyfile $'cd personal\nmkfile s1 a\n' > /dev/null
+C1=$(created_by "$before"); R1=$(removed_since "$before")
 before=$(snap); run alice_keyfile "cd personal"$'\n'"mkfile s2 $(printf 'b%.0s' $(seq 1 200))"$'\n' > /dev/null
-S2=$(created_by "$before")
-check "one new object per new file" "1 1" "$(printf '%s\n' "$S1" | wc -l) $(printf '%s\n' "$S2" | wc -l)"
-check "blob sizes are padded to one bucket" "$(stat -c %s filesystem/$S1)" "$(stat -c %s filesystem/$S2)"
+C2=$(created_by "$before")
+check "new file: two objects created, one replaced" "2 2 1" "$(count "$C1") $(count "$C2") $(count "$R1")"
+# Each file's blob is the object that survives the next write (the tree
+# version created alongside it is replaced by then).
+S1=$(comm -12 <(printf '%s\n' "$C1") <(snap))
+run alice_keyfile $'mkdir personal/zz\n' > /dev/null
+S2=$(comm -12 <(printf '%s\n' "$C2") <(snap))
+check "blob sizes are padded to one bucket" "284 284" "$(stat -c %s filesystem/$S1) $(stat -c %s filesystem/$S2)"
 
 # Every file under filesystem/ is AES-GCM output: nonce(12) + 256-byte-padded
 # ciphertext + tag(16). Nothing is stored as plaintext JSON.
@@ -368,34 +380,43 @@ cp bob.bak public_keys/$BOB_UID.pem
 cp filesystem/$S1 save1
 cp filesystem/$S2 filesystem/$S1
 out=$(run alice_keyfile $'cd personal\ncat secret.txt\ncat file1\ncat zfile\ncat live.txt\ncat s1\ncat s2\ncat dir1/sub/f\n' | grep -c 'integrity check failed')
-check "swapped blob detected (AAD/signature bound to location)" "1" "$out"
+check "swapped blob detected (hash and AAD bound to location)" "1" "$out"
 cp save1 filesystem/$S1
 
-# Bit flip in alice's tree (the only object rewritten by mkdir) -> refused.
+# mkdir: one new tree version, the old version removed, the root rewritten.
 before=$(snap); touch marker; sleep 0.01
 run alice_keyfile $'mkdir personal/newdir\n' > /dev/null
-META=$(modified_since "$before" marker)
-check "mkdir rewrites exactly one object" "1" "$(printf '%s\n' "$META" | grep -c .)"
+META=$(created_by "$before")
+ROOT=$(modified_since "$before" marker)
+check "mkdir: new tree version, old one removed, root rewritten" "1 1 1" \
+    "$(count "$META") $(count "$(removed_since "$before")") $(count "$ROOT")"
 cp filesystem/$META meta.bak
 printf '\xff' | dd of=filesystem/$META bs=1 seek=40 conv=notrunc 2>/dev/null
 check "tampered tree detected" "Error: filesystem integrity check failed" "$(run alice_keyfile $'cd personal\nls\n')"
 cp meta.bak filesystem/$META
 
 # Cross-user swap: copy alice's tree over bobby's -> bobby must NOT see alice's
-# files (the AAD names the owner), he gets an integrity error instead.
-touch marker; sleep 0.01
+# files (hash and AAD name the owner), he gets an integrity error instead.
+before=$(snap)
 run bobby_keyfile $'mkdir personal/bdir\n' > /dev/null
-BMETA=$(modified_since "$(snap)" marker)
+BMETA=$(created_by "$before")
 cp filesystem/$BMETA bmeta.bak
 cp filesystem/$META filesystem/$BMETA
 check "another user's tree copied in is rejected" "Error: filesystem integrity check failed" "$(run bobby_keyfile $'cd personal\nls\n')"
 cp bmeta.bak filesystem/$BMETA
 
-# Registry = the pre-existing object that adduser rewrites. Tamper -> fail closed.
-before=$(snap); touch marker; sleep 0.01
+# The root (fixed name, rewritten by every change). Tamper -> fail closed.
+cp filesystem/$ROOT root.bak
+printf '\x00' | dd of=filesystem/$ROOT bs=1 seek=100 conv=notrunc 2>/dev/null
+check "tampered root rejected" "Invalid keyfile" "$(./fileserver alice_keyfile < /dev/null | head -1)"
+cp root.bak filesystem/$ROOT
+
+# Registry: adduser writes the new user's tree and a new registry version
+# (with five users, the registry is the one larger than 284 bytes).
+before=$(snap)
 run admin_keyfile $'adduser dave\n' > /dev/null
-REG=$(modified_since "$before" marker)
-check "adduser rewrites exactly one existing object" "1" "$(printf '%s\n' "$REG" | grep -c .)"
+REG=$(for f in $(created_by "$before"); do [ "$(stat -c %s filesystem/$f)" -gt 284 ] && echo "$f"; done)
+check "adduser: new registry version located" "1" "$(count "$REG")"
 cp filesystem/$REG reg.bak
 printf '\x00' | dd of=filesystem/$REG bs=1 seek=100 conv=notrunc 2>/dev/null
 check "tampered registry rejected" "Invalid keyfile" "$(./fileserver alice_keyfile < /dev/null | head -1)"
@@ -419,15 +440,18 @@ Forbidden
 /shared/alice/pa" "$(run carol_keyfile $'cd /shared/alice/pa\npwd\nmkfile x y\nmkdir d\nshare same bobby\npwd\n')"
 check "unshared sibling directories are not revealed" "/shared/alice/adir doesn't exist" "$(run carol_keyfile $'cat /shared/alice/adir\n')"
 
-# A share rewrites exactly one object: the recipient's share list.
+# A share writes a new version of the recipient's list, removes the old one
+# and rewrites the root.
 before=$(snap); touch marker; sleep 0.01
 run alice_keyfile $'share personal/zfile carol\n' > /dev/null
-CAROL_SH=$(modified_since "$before" marker)
-check "share rewrites exactly the recipient's list" "1 0" \
-    "$(printf '%s\n' "$CAROL_SH" | grep -c .) $(created_by "$before" | grep -c .)"
-before=$(snap); touch marker; sleep 0.01
-run alice_keyfile $'share personal/secret.txt bobby\n' > /dev/null
-BOB_SH=$(modified_since "$before" marker)
+CAROL_SH=$(created_by "$before")
+check "share: new list version, old one removed, root rewritten" "1 1 1" \
+    "$(count "$CAROL_SH") $(count "$(removed_since "$before")") $(count "$(modified_since "$before" marker)")"
+check "re-sharing an already shared file writes nothing" "0" \
+    "$(b=$(snap); run alice_keyfile $'share personal/zfile carol\n' > /dev/null; count "$(created_by "$b")")"
+before=$(snap)
+run alice_keyfile $'share personal/zfile bobby\n' > /dev/null
+BOB_SH=$(created_by "$before")
 check "share objects located" "yes" "$([ -f "filesystem/$CAROL_SH" ] && [ -f "filesystem/$BOB_SH" ] && [ "$CAROL_SH" != "$BOB_SH" ] && echo yes)"
 
 CAROL_VIEW=$(run carol_keyfile $'cd shared/alice\nls\n')
@@ -456,6 +480,90 @@ d -> ..
 d -> admin
 d -> alice
 d -> bobby" "$(run carol_keyfile $'cd /shared\nls\n')"
+
+# ---------------------------------------------------------------- rollback (Merkle tree + internal/state, static keyfiles)
+keysums() { sha256sum *_keyfile | sha256sum; }
+K0=$(keysums)
+run alice_keyfile $'mkdir personal/rb\nmkfile personal/rb/f v1\n' > /dev/null
+cp -a filesystem snapA                              # attacker's snapshot: rb/f = v1
+run alice_keyfile $'mkfile personal/rb/f v2\nmkfile personal/rb/later evidence\nshare personal/rb/f bobby\n' > /dev/null
+check "bobby sees v2" "v2" "$(run bobby_keyfile $'cat /shared/alice/rb/f\n')"
+check "keyfiles are never modified by sessions" "$K0" "$(keysums)"
+check "internal/state is ciphertext" "0" "$(grep -caE '"epoch"|"root"' internal/state)"
+# The genuine current state is filesystem/ + internal/ together.
+save_current() { rm -rf current current_in; cp -a filesystem current; cp -a internal current_in; }
+restore_current() { rm -rf filesystem internal; cp -a current filesystem; cp -a current_in internal; }
+save_current
+
+# A complete, consistent old snapshot of filesystem/: internal/state (assumed
+# out of the attacker's reach) records a newer root -> refused for everyone,
+# including users who never saw the newer state.
+rm -rf filesystem; cp -a snapA filesystem
+check "snapshot rollback detected (alice)" "Error: filesystem change detected" "$(./fileserver alice_keyfile < /dev/null | head -1)"
+check "snapshot rollback detected (carol, never saw it)" "Error: filesystem change detected" "$(./fileserver carol_keyfile < /dev/null | head -1)"
+restore_current
+
+# Only the root rolled back, current objects kept -> refused at start-up.
+cp snapA/$ROOT filesystem/$ROOT
+check "old root detected" "Error: filesystem change detected" "$(./fileserver alice_keyfile < /dev/null | head -1)"
+cp current/$ROOT filesystem/$ROOT
+
+# Crash between writing the root and internal/state: the state is one epoch
+# behind. Only a genuine commit produces that, so it is accepted and repaired.
+cp internal/state state.bak
+run alice_keyfile $'mkdir personal/crash\n' > /dev/null
+cp state.bak internal/state
+check "crash recovery: state one epoch behind is repaired" "/personal/crash yes" \
+    "$(run alice_keyfile $'cd personal/crash\npwd\n') $(cmp -s state.bak internal/state && echo no || echo yes)"
+cp internal/state state.bak
+run alice_keyfile $'mkdir personal/c2\nmkdir personal/c3\n' > /dev/null
+cp state.bak internal/state
+check "state two epochs behind refused" "Error: filesystem change detected" "$(./fileserver alice_keyfile < /dev/null | head -1)"
+rm internal/state
+check "missing internal/state refused" "Error: filesystem change detected" "$(./fileserver alice_keyfile < /dev/null | head -1)"
+restore_current
+
+
+# A replaced version restored under its OLD name is simply unreferenced.
+for f in $(comm -23 <(ls snapA) <(ls current)); do cp snapA/$f filesystem/$f; done
+check "old versions put back are ignored" "v2" "$(run alice_keyfile $'cat personal/rb/f\n')"
+restore_current
+# An old version copied under ANY current name fails the parent's hash. Tried
+# for every object created since the snapshot, read back by both users.
+OLD=$(comm -23 <(ls snapA) <(ls current) | grep -vx "$ROOT" | head -1)
+bad=0
+for NEW in $(comm -13 <(ls snapA) <(ls current)); do
+    cp snapA/$OLD filesystem/$NEW
+    out=$(run alice_keyfile $'cat personal/rb/f\ncat personal/rb/later\n'; run bobby_keyfile $'cd /shared/alice/rb\nls\n')
+    printf '%s\n' "$out" | grep -q 'integrity check failed' || { bad=1; echo "    not detected: $NEW"; }
+    cp current/$NEW filesystem/$NEW
+done
+check "old version under a current name rejected" "0" "$bad"
+
+# Rollback during a running session: detected on the next command.
+mkfifo bob_in2
+./fileserver bobby_keyfile < bob_in2 > bob_out2 &
+BOB_PID=$!
+exec 4> bob_in2
+echo 'pwd' >&4
+sleep 0.3
+rm -rf filesystem; cp -a snapA filesystem
+echo 'pwd' >&4
+echo 'exit' >&4
+exec 4>&-
+wait "$BOB_PID"
+check "rollback during a session detected" "Error: filesystem change detected" "$(strip_prompts < bob_out2 | tail -1)"
+restore_current
+
+# Emptying or deleting filesystem/ never re-initialises over existing keys.
+sum0=$(sha256sum admin_keyfile)
+rm -f filesystem/*
+check "emptied filesystem refused" "Error: filesystem missing; refusing to re-initialise" "$(./fileserver alice_keyfile < /dev/null | head -1)"
+rm -rf filesystem
+check "deleted filesystem refused" "Error: filesystem missing; refusing to re-initialise" "$(./fileserver admin_keyfile < /dev/null | head -1)"
+check "admin_keyfile untouched" "$sum0" "$(sha256sum admin_keyfile)"
+restore_current
+check "restored filesystem works" "v2" "$(run alice_keyfile $'cat personal/rb/f\n')"
 
 # ---------------------------------------------------------------- fresh dir & existing empty fs dir
 mkdir fresh && cd fresh && cp ../fileserver . && mkdir filesystem

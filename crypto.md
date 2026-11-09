@@ -3,8 +3,8 @@
 This document explains how cryptography works in `cc-new`:
 - which primitives it uses;
 - where every key comes from and lives;
-- how objects are encrypted and named;
-- how login works;
+- how objects are encrypted, named and linked into a Merkle tree;
+- how login works, and how rollback is detected;
 - what each mechanism guarantees;
 - the known limits.
 
@@ -14,6 +14,9 @@ The data layout is described in [`ARCH.md`](ARCH.md).
 - One **master key** compiled into the binary protects everything in `filesystem/`.
 - Two independent keys are derived from it: one encrypts every object with AES-256-GCM, the other
   names every object with HMAC.
+- Objects are linked into a **Merkle tree** by SHA-256, so restoring old copies of *some* objects
+  is always detected. The current root is pinned in `internal/state`, a folder **assumed safe**,
+  so restoring a *complete* old snapshot is detected too (§5a). Keyfiles stay static.
 - Users hold **Ed25519** key pairs that are used **only to log in**, never to encrypt.
 - No cryptography is implemented by hand. Every primitive is an OpenSSL 3 EVP call.
 
@@ -28,6 +31,7 @@ The data layout is described in [`ARCH.md`](ARCH.md).
 | Key derivation | HKDF-SHA-256 (RFC 5869), empty salt | `EVP_KDF_fetch("HKDF")`, `EVP_KDF_derive` |
 | User keys, login | Ed25519 (PureEdDSA, RFC 8032) | `EVP_PKEY_Q_keygen("ED25519")`, `EVP_DigestSign`/`EVP_DigestVerify` (no digest) |
 | Key fingerprints | SHA-256 of the DER SubjectPublicKeyInfo | `i2d_PUBKEY`, `EVP_Digest(EVP_sha256())` |
+| Merkle links | SHA-256 of each object's bytes on disk | `EVP_Digest(EVP_sha256())` (`sha256Hex`) |
 | Randomness | OpenSSL CSPRNG | `RAND_bytes` |
 | Key serialisation | PKCS#8 / SubjectPublicKeyInfo PEM | `PEM_write_bio_PrivateKey` (to `BIO_s_secmem`), `PEM_read_bio_*` |
 | Constant-time compare | memory compare | `CRYPTO_memcmp` |
@@ -38,6 +42,7 @@ The data layout is described in [`ARCH.md`](ARCH.md).
   integrity.
 - HKDF keeps the subkeys independent.
 - HMAC is a keyed, deterministic function, so names can be recomputed but not guessed.
+- SHA-256 is collision-resistant, so a parent's recorded hash pins exactly one child version.
 - Ed25519 is the modern SSH default: deterministic signatures, no padding modes to misconfigure,
   fast key generation.
 
@@ -88,7 +93,7 @@ Every file under `filesystem/` is produced by `Store::putObject` and read by `St
 plaintext  = JSON document (UTF-8 text)
 padded     = u32_be(len(plaintext)) || plaintext || 0x00 … up to a multiple of 256 bytes
 nonce      = RAND_bytes(12)                                     fresh for every write
-aad        = "bibifi-new/v1|" + label
+aad        = "bibifi-new/v2|" + label          (the label includes the version)
 ct, tag    = AES-256-GCM-Encrypt(K_enc, nonce, padded, aad)     128-bit tag
 file       = nonce || ct || tag                                 written via temp file + rename()
 ```
@@ -96,11 +101,14 @@ file       = nonce || ct || tag                                 written via temp
 ### Decrypt (`aeadDecrypt`)
 
 1. Read the file, refusing symlinks, non-regular files and anything over 64 MiB.
-2. Split it into nonce, ciphertext and tag, and run AES-256-GCM decryption with
-   `aad = "bibifi-new/v1|" + label`.
-3. **Verify the tag first.** On any mismatch, return nothing, so no unauthenticated byte is used.
-4. Remove the padding: the length prefix must fit inside the buffer.
-5. Only now parse the JSON, with a depth limit, exact keys and typed fields.
+2. **Check the Merkle link:** the SHA-256 of the file's bytes must equal the hash the parent
+   recorded (§3a). The root has no parent; it must be the root recorded in `internal/state`
+   (§5a).
+3. Split it into nonce, ciphertext and tag, and run AES-256-GCM decryption with
+   `aad = "bibifi-new/v2|" + label`.
+4. **Verify the tag first.** On any mismatch, return nothing, so no unauthenticated byte is used.
+5. Remove the padding: the length prefix must fit inside the buffer.
+6. Only now parse the JSON, with a depth limit, exact keys and typed fields.
 
 ### The associated data binds each object to its location
 
@@ -110,19 +118,39 @@ authentication fails:
 
 | Attack | Why it fails |
 |---|---|
-| Copy Bob's tree over Alice's tree | encrypted for `tree\|bob-uid`, decrypted as `tree\|alice-uid` |
-| Swap the contents of two files | `blob\|uid\|id1` ≠ `blob\|uid\|id2` |
-| Copy Bob's share list over Alice's (to see Bob's shares) | `share\|bob-uid` ≠ `share\|alice-uid` |
+| Copy Bob's tree over Alice's tree | encrypted for `tree\|bob-uid\|…`, decrypted as `tree\|alice-uid\|…` |
+| Swap the contents of two files | `blob\|uid\|id1\|…` ≠ `blob\|uid\|id2\|…` |
+| Copy Bob's share list over Alice's (to see Bob's shares) | `share\|bob-uid\|…` ≠ `share\|alice-uid\|…` |
+| Put an old version under a current version's name | `…\|<old ver>` ≠ `…\|<current ver>`, and the parent's hash differs |
 | Move Alice's blob into Bob's name | the owner uid is part of the label |
 | Use a blob as a tree, or the registry as anything else | the object kind is the first part of the label |
 | Flip any bit, truncate, append | the GCM tag no longer verifies |
 | Write any JSON by hand | no valid tag without `K_enc` |
 
-**Share lists.** Each recipient has one share list, label `share|<recipient-uid>`. Its associated
+**Share lists.** Each recipient has one share list, label `share|<recipient-uid>|<ver>`. Its associated
 data names the recipient, so a list belongs to exactly one user. Each entry inside it names the
 owner, the file and its path, all under the same authentication tag, so entries can't be added,
 removed or edited individually either. A list that fails authentication is never shown and never
 overwritten; the recipient gets `Error: filesystem integrity check failed`.
+
+### 3a. Merkle links: every parent pins its children
+
+Encryption alone proves an object was written by the program for this label. It doesn't prove it
+is the **current** one. So every parent also records, for each child, a reference
+`{"ver": n, "hash": SHA-256(child's bytes on disk)}`:
+
+```
+root ──► registry|v, tree|uid|v (one per user), share|uid|v (one per recipient)
+tree ──► blob|uid|id|v (one per file)
+```
+
+* **Every change writes new versions under new labels.** The version is part of the label, so it
+  is part of both the file name and the associated data. The new root (epoch + 1) is written
+  last, and then the replaced versions are deleted.
+* **Reading checks every link on the way down:** root → tree → file, or root → share list →
+  owner's tree → file. Any object that isn't exactly the version its parent recorded fails.
+* **What this rules out:** mixing old and new state. A *complete*, consistent old snapshot,
+  root included, is caught by `internal/state` instead (§5a).
 
 ### Padding hides sizes
 
@@ -143,14 +171,15 @@ overwrite of the same object, uses a **fresh** nonce.
 ## 4. Object names
 
 ```
-file name = hex( HMAC-SHA-256(K_names, label) )      e.g. label "tree|06bbc7b1…" → "b16b0787…"
+file name = hex( HMAC-SHA-256(K_names, label) )      e.g. label "tree|4d8cbbd9…|9" → "02a661fb…"
 ```
 
 * **Deterministic:** the program can find any object without an index.
 * **Unlinkable without `K_names`:** names look random and unrelated. Nobody can compute the name
   for a given user or file, tell which objects belong to the same user, or tell a tree from a blob.
-* **No information in names:** labels contain uids and blob ids, but only their HMAC reaches the
-  disk. A test checks that no uid appears in any file name or content.
+* **No information in names:** labels contain uids, blob ids and versions, but only their HMAC
+  reaches the disk. A test checks that no uid appears in any file name or content. Two versions
+  of the same object have unrelated names.
 
 ---
 
@@ -160,9 +189,10 @@ The spec asks for "authentication … similar to ssh key (public/private)". `log
 `src/shell.cpp`:
 
 ```
-1. kf  = parse keyfile                    strict JSON; Ed25519 key only; no encrypted PEM
-2. reg = getObject("registry")            AES-GCM under K_enc: only the program can have written it
-   me  = reg.byUid(kf.uid)
+1. kf   = parse keyfile                   strict JSON; Ed25519 key only; no encrypted PEM
+2. root = getObject("root")               AES-GCM under K_enc: only the program can have written it
+   reg  = getObject(registry|v, hash)     pinned by the root
+   me   = reg.byUid(kf.uid)
    require me.name == kf.user
    require me.fpr  == SHA-256(SPKI(kf.private_key))           constant-time compare
 3. pub = public_keys/<uid>.pem
@@ -172,7 +202,8 @@ The spec asks for "authentication … similar to ssh key (public/private)". `log
 4. Identity = { me.name, me.uid, admin = (me.role == "admin") }
 ```
 
-Any failure prints `Invalid keyfile`. The cause is never revealed.
+Any failure prints `Invalid keyfile`; the cause is never revealed. The keyfile is only read, never
+written.
 
 **What makes it sound:**
 - **The registry is the trust anchor.** It is authenticated with `K_enc`, so nobody without the
@@ -191,6 +222,29 @@ Any failure prints `Invalid keyfile`. The cause is never revealed.
 | Replace alice's `public_keys/<uid>.pem` with your key | step 3: the fingerprint differs; alice is locked out (denial of service), but nobody gets in as her |
 | An RSA or other non-Ed25519 key | step 1 |
 | An encrypted PEM (would prompt for a passphrase) | step 1: rejected without prompting |
+
+### 5a. Rollback detection: `internal/state`
+
+Keyfiles are **static**: written once at `adduser` and never modified. The trusted record of
+"which root is current" lives instead in `internal/state`, next to the binary:
+
+```
+internal/state = AES-256-GCM_K_enc( {"epoch": E, "root": SHA-256(root bytes)} ),  AAD "bibifi-new/v2|internal-state"
+```
+
+* **Assumption:** clients can't read, modify or restore `internal/`. This goes beyond the spec,
+  which protects only keyfiles, so it must be confirmed with the teaching team. Encryption and
+  authentication stop forgery, and the assumption stops rollback of the record itself.
+* **Written** after every new root: new versions → root → `internal/state` → delete old versions.
+* **Checked** at start-up (before login) and before every command. The root on disk must be the
+  recorded one (same epoch and SHA-256), or exactly one epoch ahead. The second case is a crash
+  between writing the root and the state; only a genuine commit can produce it, so it is accepted
+  and repaired. Anything else gives `Error: filesystem change detected`.
+* **What it catches:** any rollback of `filesystem/`, partial or complete, and any fork built on an
+  old snapshot (the program refuses to start on it, so nobody can commit on top of it). This holds
+  for every user, including users who never saw the newer state.
+* **Also:** within a session the root never goes backwards (an in-memory check), and an empty or
+  missing `filesystem/` is never re-initialised while keys or `internal/` exist.
 
 **After login, the user's private key isn't needed.** The session keeps only the name, uid and
 admin flag. Every later decision about what the user may read or write is made by the shell
@@ -212,13 +266,15 @@ The attacker considered here is any local user who can read and write everything
 | Who owns which object, who shared with whom | HMAC names, no uid on disk, encrypted share lists | yes (for the stored data; see §7.5 for what watching changes reveals) |
 | Exact file sizes | 256-byte padding | yes (sizes leak only in 256-byte steps) |
 | Forging or editing any object | GCM tag | yes |
-| Copying or moving an object between users or locations | label in the associated data | yes |
+| Copying or moving an object between users or locations | label in the associated data, parent's hash | yes |
 | Impersonating another user | registry fingerprint plus challenge/response | yes |
-| **Restoring an older genuine copy of an object** | — | **no** (§7) |
+| Restoring older copies of some objects (mixing old and new state) | Merkle links (hash + version) | yes |
+| Restoring a complete older snapshot of `filesystem/` | `internal/state` pins the current root | yes, under the `internal/` assumption (§5a, §7.3) |
 | **Deleting objects** | — | **no:** fails closed (denial of service) |
 
 All failures **fail closed**: tampered data gives `Error: filesystem integrity check failed` and
-is never shown, and a broken registry or keyfile gives `Invalid keyfile`.
+is never shown, a broken root, registry or keyfile gives `Invalid keyfile`, and a root that isn't the
+one `internal/state` records gives `Error: filesystem change detected`.
 
 ---
 
@@ -238,15 +294,18 @@ All users' files are encrypted with the same `K_enc`. "Bob can't read Alice's fi
 by the program's access rules, backed by the fact that nobody can decrypt anything outside the
 program. There is no per-user cryptographic isolation.
 
-### 7.3 Rollback isn't detected
-GCM proves an object was written by the program for this location, not that it is the **latest**
-version. Restoring an older copy makes a file show old contents, hides files created later (a
-rolled-back tree), or removes users added later (a rolled-back registry). Tested: `v2` → restore →
-`v1`. Rollback can't produce content the program never wrote.
-
-Fixing it means chaining version numbers into the associated data, up to a root object whose epoch
-is anchored in each user's keyfile. That catches every rollback except restoring the whole
-filesystem to a state newer than the user's last session, which needs a trusted third party.
+### 7.3 Rollback rests on the `internal/` assumption
+Every rollback of `filesystem/` is detected **as long as `internal/` is safe**. What that means:
+- **If the assumption is rejected** (clients can also restore `internal/`), an attacker can
+  restore `filesystem/` and `internal/` together, and that complete snapshot is accepted. The
+  Merkle links still catch every partial rollback, so the attacker still can't roll back one
+  chosen file, tree or share.
+- **Why not use the keyfiles instead:** they are the only place the spec protects, but they are
+  deliberately static (written once, never modified). Keeping state in them would also need the
+  root to record its own history, because otherwise a user could lower their own value and replay
+  an old snapshot forward.
+- **What rollback can never do:** produce content the program didn't write. Every object is
+  authenticated with `K_enc`.
 
 ### 7.4 Keyfiles are bearer credentials
 The private key is stored unencrypted, as the spec requires (no passphrase prompt). Whoever copies
@@ -290,8 +349,12 @@ revocation or rotation command.
 | Master key | `src/internal_secret.h`: `kInternalMasterKey` |
 | Subkey derivation | `src/storage.cpp`: `Store::Store` (HKDF `info` strings) |
 | AES-GCM and padding | `src/crypto.cpp`: `aeadEncrypt`, `aeadDecrypt`, `pad`, `unpad` |
-| Object encryption and naming | `src/storage.cpp`: `putObject`, `getObject`, `objectPath` |
-| Share lists | `src/storage.cpp`: `saveShare`, `loadShares` |
+| Object encryption, naming, Merkle hash check | `src/storage.cpp`: `putObject`, `getObject`, `objectPath`; `src/crypto.cpp`: `sha256Hex` |
+| Root, references, versioned labels | `src/storage.cpp`: `saveRoot`, `loadRoot`, `refFromJson`, `treeLabel`… |
+| Commit and in-session rollback check | `src/shell.cpp`: `Shell::commit`, `Shell::refresh` |
+| Trusted root record | `src/storage.cpp`: `saveState`, `checkFresh`; `src/main.cpp` (start-up check) |
+| Wiped-filesystem refusal | `src/storage.cpp`: `needsInit`, `isWiped`; `src/main.cpp` |
+| Share lists | `src/storage.cpp`: `saveShares`, `loadShares`; `src/shell.cpp`: `sharedWith` |
 | Ed25519 keys and signatures | `src/crypto.cpp`: `generateUserKey`, `sign`, `verify`, `fingerprint` |
 | Login | `src/shell.cpp`: `login`; `src/storage.cpp`: `proveKeyPossession`, `loadPinnedPublicKey` |
 | Randomness, wiping, atomic writes | `src/util.cpp`: `randomBytes`, `wipe`, `writeFileAtomic` |

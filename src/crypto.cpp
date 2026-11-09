@@ -234,6 +234,13 @@ Bytes hmacSha256(const Key256& key, const std::string& msg) {
     return out;
 }
 
+std::string sha256Hex(const Bytes& data) {
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int mdLen = 0;
+    if (EVP_Digest(data.data(), data.size(), md, &mdLen, EVP_sha256(), nullptr) != 1) fail("digest failed");
+    return toHex(md, mdLen);
+}
+
 Key256 hkdfSha256(const Key256& ikm, const std::string& info) {
     EVP_KDF* kdf = EVP_KDF_fetch(nullptr, "HKDF", nullptr);
     if (kdf == nullptr) fail("HKDF unavailable");

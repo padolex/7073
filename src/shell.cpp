@@ -10,6 +10,10 @@ namespace {
 struct IntegrityError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+struct RollbackError : std::runtime_error {
+    RollbackError() : std::runtime_error("filesystem change detected") {}
+};
+[[noreturn]] void integrityFailure() { throw IntegrityError("filesystem integrity check failed"); }
 
 std::string nextToken(const std::string& s, std::size_t& pos) {
     while (pos < s.size() && s[pos] == ' ') ++pos;
@@ -40,10 +44,12 @@ std::optional<Identity> login(const Store& store, const fs::path& keyfile) {
         auto kf = store.readKeyfile(keyfile);
         if (!kf) return std::nullopt;
 
-        // 2. The registry is authenticated with the master key, so only this
-        //    program can have written it. It must list this uid under this
-        //    exact name, with this exact key.
-        auto reg = store.loadRegistry();
+        // 2. The root and registry are authenticated with the master key and
+        //    linked by hash, so only this program can have written them. The
+        //    registry must list this uid under this exact name and key.
+        auto root = store.loadRoot();
+        if (!root) return std::nullopt;
+        auto reg = store.loadRegistry(root->registry);
         if (!reg) return std::nullopt;
         const UserRec* me = reg->byUid(kf->uid);
         if (me == nullptr || me->name != kf->username || !constTimeEqual(me->fpr, fingerprint(kf->priv.get()))) {
@@ -84,49 +90,89 @@ void Shell::printHelp() {
 }
 
 void Shell::refresh() {
-    cache_.clear();
-    auto reg = store_.loadRegistry();
-    if (!reg) throw IntegrityError("filesystem integrity check failed");
+    trees_.clear();
+    shared_.clear();
+    auto root = store_.loadRoot();
+    if (!root) integrityFailure();
+    // The root must be the one ./internal/state records (no rollback of
+    // ./filesystem), and within a session it can only move forward.
+    if (store_.checkFresh(*root) != Store::Freshness::Current || root->epoch < sessionEpoch_) {
+        throw RollbackError();
+    }
+    auto reg = store_.loadRegistry(root->registry);
+    if (!reg) integrityFailure();
+    root_ = std::move(*root);
     reg_ = std::move(*reg);
+    sessionEpoch_ = root_.epoch;
 }
 
-Shell::UserData& Shell::data(const std::string& uid) {
-    auto it = cache_.find(uid);
-    if (it != cache_.end()) return it->second;
+void Shell::commit(const Root& next, const std::vector<std::string>& replaced) {
+    // The design assumes one writing session at a time (no locks). If another
+    // session committed since this command started, writing our root would
+    // drop its changes and could leave its data unreferenced: abort instead.
+    // The objects written so far stay unreferenced and harmless.
+    auto current = store_.loadRoot();
+    if (!current || current->epoch != root_.epoch) {
+        throw IntegrityError("filesystem changed by another session, try again");
+    }
+    Root committed = next;
+    committed.hash = store_.saveRoot(next);  // the commit point: until now nothing new is referenced
+    store_.saveState(committed.epoch, committed.hash);
+    for (const auto& label : replaced) store_.discard(label);
+    root_ = committed;
+    sessionEpoch_ = next.epoch;
+    trees_.clear();
+    shared_.clear();
+}
 
-    // Only locate() calls this, and it only ever names the caller's own uid
-    // or, for the admin, another user's uid (read-only).
-    UserData d;
-    auto tree = store_.loadTree(uid);
-    if (!tree) throw IntegrityError("filesystem integrity check failed");
-    d.tree = std::move(*tree);
+const json& Shell::treeOf(const std::string& uid) {
+    auto it = trees_.find(uid);
+    if (it != trees_.end()) return it->second;
+    auto ref = root_.trees.find(uid);
+    if (ref == root_.trees.end()) integrityFailure();
+    auto tree = store_.loadTree(uid, ref->second);
+    if (!tree) integrityFailure();
+    return trees_.emplace(uid, std::move(*tree)).first->second;
+}
 
-    auto shares = store_.loadShares(uid);
-    if (!shares) throw IntegrityError("filesystem integrity check failed");
-    for (const ShareRec& r : *shares) {
+std::vector<ShareRec> Shell::shareListOf(const std::string& uid) {
+    auto ref = root_.shares.find(uid);
+    if (ref == root_.shares.end()) return {};  // nothing shared with this user yet
+    auto list = store_.loadShares(uid, ref->second);
+    if (!list) integrityFailure();
+    return *list;
+}
+
+// The files shared with `uid`, grouped by owner, each at its path in the
+// owner's /personal. File nodes are copied from the owner's (verified) tree,
+// so reading one checks the owner's current version and hash.
+const Shell::SharedView& Shell::sharedWith(const std::string& uid) {
+    auto it = shared_.find(uid);
+    if (it != shared_.end()) return it->second;
+    SharedView view;
+    for (const ShareRec& r : shareListOf(uid)) {
         const UserRec* owner = reg_.byUid(r.ownerUid);
         if (owner == nullptr || owner->uid == uid) continue;
-        SharedFrom& from = d.shares[owner->name];
+        const auto comps = splitPath(r.path);
+        const json* node = findNode(treeOf(owner->uid), comps);
+        if (node == nullptr || !isFileNode(*node) || fileBlob(*node) != r.blob) integrityFailure();
+        SharedFrom& from = view[owner->name];
         if (from.tree.is_null()) {
             from.ownerUid = owner->uid;
             from.tree = makeDirNode();
         }
-        // Rebuild the owner's path: /shared/<owner>/a/b/file. Intermediate
-        // directories exist only as far as shared files need them.
-        const auto comps = splitPath(r.path);
+        // Directories exist only as far as shared files need them.
         json* dir = &from.tree;
         for (std::size_t i = 0; dir != nullptr && i + 1 < comps.size(); ++i) {
             json& children = dir->at("children");
             if (!children.contains(comps[i])) children[comps[i]] = makeDirNode();
             dir = isDirNode(children[comps[i]]) ? &children[comps[i]] : nullptr;
         }
-        // A path can only clash with another share if the stored list is
-        // inconsistent; the first entry wins and the rest are ignored.
         if (dir != nullptr && !dir->at("children").contains(comps.back())) {
-            dir->at("children")[comps.back()] = makeFileNode(r.blob);
+            dir->at("children")[comps.back()] = *node;
         }
     }
-    return cache_.emplace(uid, std::move(d)).first->second;
+    return shared_.emplace(uid, std::move(view)).first->second;
 }
 
 // Maps a virtual absolute path to the data it denotes.
@@ -166,12 +212,12 @@ Shell::Loc Shell::locate(const std::vector<std::string>& comps) {
         if (l.rest.empty()) {
             l.type = NType::Dir;
         } else {
-            const json* node = findNode(data(l.targetUid).tree, l.rest);
+            const json* node = findNode(treeOf(l.targetUid), l.rest);
             if (node != nullptr) l.type = isDirNode(*node) ? NType::Dir : NType::File;
         }
     } else if (area == "shared") {
         l.area = Area::Shared;
-        const auto& sh = data(l.targetUid).shares;
+        const auto& sh = sharedWith(l.targetUid);
         if (l.rest.empty()) {
             l.type = NType::Dir;
         } else if (auto it = sh.find(l.rest[0]); it != sh.end()) {
@@ -209,7 +255,7 @@ std::string Shell::prompt() const { return id_.name + ":/" + joinPath(cwd_) + ">
 
 bool Shell::execute(const std::string& rawLine) {
     std::string line = rawLine;
-    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (!line.empty() && (line.back() == '\r' || line.back() == '\t')) line.pop_back();
     if (line.size() > kMaxLineLength || !isPrintableAscii(line)) {
         out_ << "Invalid Command\n";
         return true;
@@ -255,6 +301,8 @@ bool Shell::execute(const std::string& rawLine) {
         } else {
             out_ << "Invalid Command\n";
         }
+    } catch (const RollbackError& e) {
+        out_ << "Error: " << e.what() << "\n";
     } catch (const IntegrityError& e) {
         out_ << "Error: " << e.what() << "\n";
     } catch (const std::exception&) {
@@ -288,7 +336,7 @@ void Shell::cmdLs() {
             dirs.insert("shared");
             break;
         case Area::Personal: {
-            const json* node = findNode(data(l.targetUid).tree, l.rest);
+            const json* node = findNode(treeOf(l.targetUid), l.rest);
             if (node != nullptr && isDirNode(*node)) {
                 const json& children = node->at("children");
                 for (auto it = children.begin(); it != children.end(); ++it) {
@@ -298,7 +346,7 @@ void Shell::cmdLs() {
             break;
         }
         case Area::Shared: {
-            const auto& sh = data(l.targetUid).shares;
+            const auto& sh = sharedWith(l.targetUid);
             if (l.rest.empty()) {
                 for (const auto& kv : sh) dirs.insert(kv.first);
             } else if (auto it = sh.find(l.rest[0]); it != sh.end()) {
@@ -330,10 +378,12 @@ void Shell::cmdCat(const std::string& path) {
     Loc l = locate(w->comps);
     std::optional<std::string> content;
     if (l.area == Area::Personal) {
-        content = store_.loadBlob(l.targetUid, fileBlob(*findNode(data(l.targetUid).tree, l.rest)));
+        const json& node = *findNode(treeOf(l.targetUid), l.rest);
+        content = store_.loadBlob(l.targetUid, fileBlob(node), fileRef(node));
     } else {
-        const SharedFrom& from = data(l.targetUid).shares.at(l.rest[0]);
-        content = store_.loadBlob(from.ownerUid, fileBlob(*findNode(from.tree, {l.rest.begin() + 1, l.rest.end()})));
+        const SharedFrom& from = sharedWith(l.targetUid).at(l.rest[0]);
+        const json& node = *findNode(from.tree, {l.rest.begin() + 1, l.rest.end()});
+        content = store_.loadBlob(from.ownerUid, fileBlob(node), fileRef(node));
     }
     if (!content) throw IntegrityError("filesystem integrity check failed");
     out_ << sanitizeForTerminal(*content) << "\n";
@@ -394,8 +444,7 @@ std::optional<Shell::CreateTarget> Shell::resolveCreateTarget(const std::string&
 void Shell::cmdMkdir(const std::string& path) {
     auto t = resolveCreateTarget(path);
     if (!t) return;
-    UserData& d = data(t->targetUid);
-    json updated = d.tree;
+    json updated = treeOf(t->targetUid);
     json& children = findNode(updated, t->parent)->at("children");
     auto it = children.find(t->leaf);
     if (it != children.end()) {
@@ -403,30 +452,41 @@ void Shell::cmdMkdir(const std::string& path) {
         return;
     }
     children[t->leaf] = makeDirNode();
-    store_.saveTree(t->targetUid, updated);
+    Root next = root_;
+    next.epoch = root_.epoch + 1;
+    const ObjRef oldTree = root_.trees.at(t->targetUid);
+    next.trees[t->targetUid] = store_.saveTree(t->targetUid, updated, next.epoch);
+    commit(next, {treeLabel(t->targetUid, oldTree.ver)});
 }
 
 void Shell::cmdMkfile(const std::string& path, const std::string& contents) {
     auto t = resolveCreateTarget(path);
     if (!t) return;
-    UserData& d = data(t->targetUid);
-    json updated = d.tree;
+    json updated = treeOf(t->targetUid);
     json& children = findNode(updated, t->parent)->at("children");
     auto it = children.find(t->leaf);
-    if (it != children.end()) {
-        if (isDirNode(*it)) {
-            out_ << "Directory already exists\n";
-            return;
-        }
-        // Overwrite in place: same blob id, fresh nonce. Every share record
-        // keeps pointing at this blob, so recipients see the new contents.
-        store_.saveBlob(t->targetUid, fileBlob(*it), contents);
+    if (it != children.end() && isDirNode(*it)) {
+        out_ << "Directory already exists\n";
         return;
     }
-    const std::string blob = randomHex(kBlobHexLen / 2);
-    store_.saveBlob(t->targetUid, blob, contents);  // blob first, then commit the tree
-    children[t->leaf] = makeFileNode(blob);
-    store_.saveTree(t->targetUid, updated);
+    Root next = root_;
+    next.epoch = root_.epoch + 1;
+    const ObjRef oldTree = root_.trees.at(t->targetUid);
+    std::vector<std::string> replaced{treeLabel(t->targetUid, oldTree.ver)};
+    std::string blob;
+    if (it != children.end()) {
+        // Overwrite: same blob id (share entries keep pointing at it), new
+        // version. The tree records the new version and hash.
+        blob = fileBlob(*it);
+        replaced.push_back(blobLabel(t->targetUid, blob, fileRef(*it).ver));
+    } else {
+        blob = randomHex(kBlobHexLen / 2);
+    }
+    // New objects first, the root last: until commit() nothing references them.
+    const ObjRef content = store_.saveBlob(t->targetUid, blob, contents, next.epoch);
+    children[t->leaf] = makeFileNode(blob, content);
+    next.trees[t->targetUid] = store_.saveTree(t->targetUid, updated, next.epoch);
+    commit(next, replaced);
 }
 
 void Shell::cmdShare(const std::string& path, const std::string& user) {
@@ -453,9 +513,22 @@ void Shell::cmdShare(const std::string& path, const std::string& user) {
     }
     ShareRec rec;
     rec.ownerUid = id_.uid;
-    rec.blob = fileBlob(*findNode(data(l.targetUid).tree, l.rest));
+    rec.blob = fileBlob(*findNode(treeOf(l.targetUid), l.rest));
     rec.path = joinPath(l.rest);  // e.g. "a/file": shown as /shared/<me>/a/file
-    if (!store_.saveShare(target->uid, rec)) throw IntegrityError("filesystem integrity check failed");
+
+    std::vector<ShareRec> list = shareListOf(target->uid);  // fails closed if tampered
+    for (const ShareRec& r : list) {
+        if (r.ownerUid == rec.ownerUid && r.blob == rec.blob) return;  // already shared: nothing to do
+    }
+    list.push_back(rec);
+    Root next = root_;
+    next.epoch = root_.epoch + 1;
+    std::vector<std::string> replaced;
+    if (auto old = root_.shares.find(target->uid); old != root_.shares.end()) {
+        replaced.push_back(shareLabel(target->uid, old->second.ver));
+    }
+    next.shares[target->uid] = store_.saveShares(target->uid, list, next.epoch);
+    commit(next, replaced);
 }
 
 void Shell::cmdAdduser(const std::string& user) {
@@ -473,15 +546,18 @@ void Shell::cmdAdduser(const std::string& user) {
         uid = randomHex(kUidHexLen / 2);
     } while (reg_.byUid(uid) != nullptr);
 
+    Root next = root_;
+    next.epoch = root_.epoch + 1;
     store_.writePublicKey(uid, key.get());
-    store_.saveTree(uid, makeDirNode());
+    next.trees[uid] = store_.saveTree(uid, makeDirNode(), next.epoch);
     store_.writeKeyfile(user, uid, key.get());
 
-    // The registry is the commit point: the user exists only once it is
-    // listed here.
+    // The root is the commit point: the user exists only once the root that
+    // references the new registry is written.
     Registry updated = reg_;
     updated.users.push_back({user, uid, "user", fingerprint(key.get())});
-    store_.saveRegistry(updated);
+    next.registry = store_.saveRegistry(updated, next.epoch);
+    commit(next, {registryLabel(root_.registry.ver)});
 }
 
 }  // namespace bibifi

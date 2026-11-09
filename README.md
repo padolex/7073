@@ -22,7 +22,7 @@ Details:
 | Language | C++17, STL (incl. `std::filesystem`) |
 | Libraries | OpenSSL 3 `libcrypto`; nlohmann/json 3.11.3, header-only, vendored in `third_party/` (MIT) |
 | Binary | **static-PIE** ELF, full RELRO, stack protector, `_FORTIFY_SOURCE=2`, zero compiler warnings |
-| Tests | `tests/run_tests.sh`: 80 end-to-end checks; also clean under ASan + UBSan (`make test-asan`) |
+| Tests | `tests/run_tests.sh`: 98 end-to-end checks; also clean under ASan + UBSan (`make test-asan`) |
 
 ---
 
@@ -75,8 +75,9 @@ explained.
 ## 2. On-disk format
 
 ```
-./<user>_keyfile                JSON keyfile with the user's Ed25519 private key (mode 0600)
+./<user>_keyfile                JSON keyfile with the user's Ed25519 private key (0600, never modified)
 ./public_keys/<uid>.pem         Ed25519 public keys, named by an opaque random 128-bit uid
+./internal/state                the current root's epoch and SHA-256, encrypted (ASSUMED SAFE, see below)
 ./filesystem/<N(label)>         every object, in ONE flat directory
                                 N(label) = hex HMAC-SHA-256(K_names, label)
 ```
@@ -85,31 +86,42 @@ Every file in `filesystem/` has exactly this format:
 
 ```
 nonce (12 bytes) || AES-256-GCM_K_enc( pad256( JSON document ) ) || tag (16 bytes)
-associated data = "bibifi-new/v1|" + label
+associated data = "bibifi-new/v2|" + label          (labels include a version)
 ```
 
 | Label | JSON document after decryption | Written by |
 |---|---|---|
-| `registry` | `{"users":[{"name","uid","role","fpr"}, …]}` (exactly one `admin`) | `init`, `adduser` |
-| `tree\|<uid>` | the user's `/personal` tree as nested JSON (below) | `mkdir`, `mkfile` |
-| `blob\|<uid>\|<blob>` | `{"content": "<file contents>"}` | `mkfile` |
-| `share\|<uid>` | every file shared **with** that user: `{"shares":[{"owner","blob","path"}, …]}` | `share` |
+| `root` | `{"epoch":E, "registry":REF, "trees":{uid:REF}, "shares":{uid:REF}}` | every change (commit point) |
+| `registry\|<ver>` | `{"users":[{"name","uid","role","fpr"}, …]}` (exactly one `admin`) | `init`, `adduser` |
+| `tree\|<uid>\|<ver>` | the user's `/personal` tree as nested JSON (below) | `mkdir`, `mkfile` |
+| `blob\|<uid>\|<blob>\|<ver>` | `{"content": "<file contents>"}` | `mkfile` |
+| `share\|<uid>\|<ver>` | every file shared **with** that user: `{"shares":[{"owner","blob","path"}, …]}` | `share` |
 
-The nested tree after decryption:
+`REF` is `{"ver": n, "hash": "<SHA-256 of the child's bytes on disk>"}`. The nested tree after
+decryption:
 
 ```json
 {"type":"dir","children":{
   "docs":{"type":"dir","children":{
-    "a.txt":{"type":"file","blob":"ea92bda0cc9df1ceb2c460ddf919d96a"}}}}}
+    "a.txt":{"type":"file","blob":"94219130b2c9fc4b096a5197ec4a817e","ver":8,
+             "hash":"6510494aed965eb9e80fe295a5a4dc52a7c7a21dfccb5068eb1012998d292a2a"}}}}}
 ```
 
-A share entry points at the owner's blob, so when the owner overwrites a file (`mkfile`
-re-encrypts the same blob with a fresh nonce), recipients see the new contents at once. The
-entry's `path` is the file's location in the owner's `/personal`, so Bob sharing `a/file` with
-Alice appears to her as `/shared/bob/a/file`. Same-name files from different folders don't clash.
+**The objects form a Merkle tree.** The root references the current version of the registry,
+every tree and every share list; each tree references the current version of each of its files.
+Every change writes **new versions under new names**, then the new root (epoch + 1) as the single
+commit point, then deletes the replaced versions. Every read checks each link's hash. Details are
+in `ARCH.md` §3–§8.
 
-There is no lock: if two users share with the same person at the very same instant, one of the
-two shares can be lost (see `ARCH.md` §7). Shares made one after another are always kept.
+A share entry names the owner's file and its path, and is checked against the owner's current
+tree, so recipients always see the owner's latest contents. The entry's `path` is the file's
+location in the owner's `/personal`, so Bob sharing `a/file` with Alice appears to her as
+`/shared/bob/a/file`. Same-name files from different folders don't clash.
+
+**One writing session at a time.** There are no locks (standard C++ has none). Sessions that only
+read are always safe. If two sessions commit at the same instant, the second one aborts with
+`Error: filesystem changed by another session, try again` instead of overwriting the other's
+change.
 
 ### What a host observer sees
 
@@ -118,16 +130,29 @@ two shares can be lost (see `ARCH.md` §7). Shares made one after another are al
 - No username, uid, file or directory name, contents, tree shape, ownership or sharing relation.
   The tests check this.
 
-### What tampering does
+### What tampering and rollback do
 
-The associated data names each object's owner and location. So:
-- copying Bob's tree or share list over Alice's, or swapping two files' contents, fails
-  authentication;
-- a flipped bit fails authentication;
-- plaintext junk (for example a hand-written JSON share list) fails authentication.
+The associated data names each object's owner, location and version, and each parent pins its
+children's hashes. So:
+- copying Bob's tree or share list over Alice's, swapping two files' contents, putting an old
+  version under a current name, a flipped bit, or plaintext junk all fail;
+- restoring old versions under their old names does nothing: nothing references them;
+- restoring a **complete**, consistent old snapshot of `filesystem/` is caught too:
+  `internal/state` records which root is current, and is checked at start-up and before every
+  command. This works for every user, even those who never saw the newer state;
+- a crash between writing a new root and `internal/state` is recognised (the root is exactly one
+  epoch ahead) and repaired;
+- an empty or deleted `filesystem/` is refused while keys exist; it is never re-initialised over
+  `admin_keyfile`.
 
-The result is `Error: filesystem integrity check failed`, or `Invalid keyfile` if the registry is
-the object affected.
+> **Assumption, to confirm with the teaching team:** `internal/` (next to the binary) is **safe**:
+> clients can't read, modify or restore it. The spec protects only keyfiles, so this is an extra
+> assumption ("Any more assumptions, you can run it by the teaching team"). Keyfiles stay static.
+> If the assumption is rejected, an attacker who restores `filesystem/` *and* `internal/` together
+> rolls back undetected, and only partial rollbacks are caught.
+
+The results are `Error: filesystem integrity check failed`, `Error: filesystem change detected`,
+or `Invalid keyfile` if the root or registry is damaged.
 
 ---
 
@@ -137,7 +162,7 @@ the object affected.
 {
   "private_key": "-----BEGIN PRIVATE KEY-----\n…Ed25519 PKCS#8…\n-----END PRIVATE KEY-----\n",
   "type": "bibifi.keyfile",
-  "uid": "5ab72e3205608c6915ab052bdf881a51",
+  "uid": "4d8cbbd92b3a01e87ccb976023891e7b",
   "user": "alice",
   "v": 1
 }
@@ -155,8 +180,10 @@ looks and works like an SSH private key. Its fields are claims, checked at login
    the registry, and the keyfile's private key must sign a fresh 32-byte random challenge that
    verifies under it.
 
-Any failure prints `Invalid keyfile`. The admin flag comes from the registry's role for the user's
-own uid, never from the keyfile.
+The keyfile is **static**: written once by `adduser` and never modified; sessions only read it.
+
+Any failure prints `Invalid keyfile`. The admin flag comes from the registry's role
+for the user's own uid, never from the keyfile.
 
 | Attack | Result |
 |---|---|
@@ -224,10 +251,9 @@ The same as `../cc` (see `../cc/REPORT.md` §7 for every message):
 
 ### Known limitations
 
-* **Rollback isn't detected.** Restoring an older copy of an object at the same location passes
-  authentication. It is a genuine old version, so for example a file reverts to earlier contents.
-  Detecting this needs trusted fresh state (a monotonic counter), which a purely local program
-  with a world-writable disk doesn't have. Rollback can't produce data the program never wrote.
+* **Rollback protection depends on `internal/` being safe.** If clients can restore `internal/`
+  together with `filesystem/`, a complete old snapshot is accepted. Partial rollbacks are always
+  caught. See `crypto.md` §7.3.
 * **Denial of service:** anyone with write access to the host can delete or corrupt objects. The
   program fails closed but can't prevent it.
 * **Metadata:** object counts, size classes and modification times are visible. Someone who
@@ -285,7 +311,7 @@ This format is **not compatible** with `../cc`. Run each binary in its own direc
 ## 7. Test
 
 ```bash
-make test             # 80 checks in a throwaway sandbox (mktemp -d)
+make test             # 98 checks in a throwaway sandbox (mktemp -d)
 ```
 
 The suite covers:
@@ -300,8 +326,18 @@ The suite covers:
     JSON;
   - padded sizes are equal.
 - **Tampering:** a swapped blob, another user's tree copied in, a bit-flipped tree, a corrupted
-  registry, and another user's, bit-flipped, plaintext or symlinked share lists (also: a corrupt
-  list is never overwritten by a new share).
+  root, a corrupted registry, and another user's, bit-flipped, plaintext or symlinked share lists
+  (also: a corrupt list is never overwritten by a new share).
+- **Versioning and rollback:**
+  - each change creates new versions, removes the replaced ones and rewrites only the root;
+  - keyfiles are never modified by sessions, and `internal/state` is ciphertext;
+  - a complete old snapshot of `filesystem/` is refused, also for a user who never saw the newer
+    state, and so is an old root alone;
+  - crash recovery: a state one epoch behind is repaired; two behind, or missing, is refused;
+  - old versions put back under their old names are ignored;
+  - an old version under **every** current name is rejected;
+  - a rollback during a running session is caught on the next command;
+  - an emptied or deleted `filesystem/` is refused and `admin_keyfile` is untouched.
 - **Sharing with paths:** the owner's folders appear under `/shared/<owner>/`, same-name files in
   different folders are both visible, nested shared folders are read-only, unshared siblings stay
   hidden, and shares from several owners to one user are all kept.
@@ -323,7 +359,7 @@ make test-asan        # whole suite against it; any sanitizer report fails the t
 
 `test-asan` builds with `-fsanitize=address,undefined -fno-sanitize-recover=all
 -fno-omit-frame-pointer -g -O1` and writes reports to `san-logs/`. Expected output ends with
-`passed: 80  failed: 0` and `sanitizers: no reports`. The sanitizer runtimes can't be linked
+`passed: 98  failed: 0` and `sanitizers: no reports`. The sanitizer runtimes can't be linked
 statically, so this binary is for development only. **Submit `./fileserver`.**
 
 | Target | Result |

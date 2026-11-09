@@ -34,10 +34,23 @@ int main(int argc, char** argv) {
     }
 
     Store store(fs::current_path());
+    // Keys exist but the filesystem is gone or empty: it was deleted or rolled
+    // back to nothing. Re-initialising would replace admin_keyfile, so refuse.
+    if (store.isWiped()) {
+        std::cout << "Error: filesystem missing; refusing to re-initialise\n";
+        return 1;
+    }
     try {
         if (store.needsInit()) store.initialize();
     } catch (const std::exception&) {
         std::cout << "Error: could not initialise filesystem\n";
+        return 1;
+    }
+
+    // ./filesystem must be the state ./internal/state records: a restored old
+    // snapshot (or a fork of one) is refused before anyone logs in.
+    if (auto root = store.loadRoot(); root && store.checkFresh(*root) != Store::Freshness::Current) {
+        std::cout << "Error: filesystem change detected\n";
         return 1;
     }
 
